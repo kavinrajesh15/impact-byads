@@ -1,0 +1,16 @@
+services:
+  - type: cron
+    name: impact-sync
+    runtime: python
+    schedule: "0 6 * * *"  # Daily at 6 AM UTC
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: IMPACT_ACCOUNT_SID
+        sync: false
+      - key: IMPACT_AUTH_TOKEN
+        sync: false
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: SPREADSHEET_ID
+        sync: false
