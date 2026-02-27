@@ -1,4 +1,6 @@
+flask
+gunicorn
+google-api-python-client
+google-auth
 requests
 python-dotenv
-google-auth
-google-api-python-client
