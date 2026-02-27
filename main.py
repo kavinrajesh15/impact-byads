@@ -6,14 +6,20 @@ import csv
 import io
 import base64
 import requests
+import threading
 from requests.auth import HTTPBasicAuth
 from datetime import datetime, timedelta
 from collections import defaultdict
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from flask import Flask
-import threading
+from flask import Flask, jsonify
+
+# ==========================================================
+# FLASK APP — must be defined at module level
+# ==========================================================
+app = Flask(__name__)
+
 # ==========================================================
 # CONFIG
 # ==========================================================
@@ -34,7 +40,6 @@ CLICK_429_MAX_WAIT = 120
 # ==========================================================
 # LOAD CREDENTIALS
 # ==========================================================
-# Load .env file for local dev (silently skip on Render)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -49,8 +54,36 @@ if not ACCOUNT_SID or not AUTH_TOKEN:
 
 AUTH = HTTPBasicAuth(ACCOUNT_SID, AUTH_TOKEN)
 
-app = Flask(__name__)
+# ==========================================================
+# FLASK ROUTES — keep Render web service alive
+# ==========================================================
+@app.route("/")
+def index():
+    return jsonify({"status": "ok", "message": "Impact Data Sync is running."})
 
+@app.route("/health")
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+@app.route("/trigger", methods=["POST"])
+def trigger_sync():
+    """Manually trigger a sync via HTTP POST."""
+    full_refresh = False
+    skip_clicks = False
+    thread = threading.Thread(target=main, args=(full_refresh, skip_clicks), daemon=True)
+    thread.start()
+    return jsonify({"status": "sync started"}), 202
+
+@app.route("/trigger/full", methods=["POST"])
+def trigger_full_sync():
+    """Manually trigger a full refresh sync."""
+    thread = threading.Thread(target=main, args=(True, False), daemon=True)
+    thread.start()
+    return jsonify({"status": "full sync started"}), 202
+
+# ==========================================================
+# GOOGLE SHEETS HELPERS
+# ==========================================================
 def get_google_creds():
     """Load Google creds from base64 env var or local file."""
     b64 = os.getenv("GOOGLE_CREDENTIALS_JSON")
@@ -66,7 +99,10 @@ def get_google_creds():
             scopes=["https://www.googleapis.com/auth/spreadsheets"]
         )
     else:
-        raise Exception("No Google credentials found. Set GOOGLE_CREDENTIALS_JSON env var or provide credentials.json")
+        raise Exception(
+            "No Google credentials found. "
+            "Set GOOGLE_CREDENTIALS_JSON env var or provide credentials.json"
+        )
 
 def get_sheets_service():
     return build("sheets", "v4", credentials=get_google_creds())
@@ -79,7 +115,7 @@ def parse_iso_date(iso_str):
         if "T" in iso_str:
             return iso_str.split("T")[0]
         return iso_str
-    except:
+    except Exception:
         return iso_str
 
 def get_last_synced_date(service):
@@ -90,11 +126,10 @@ def get_last_synced_date(service):
             range=f"'{SHEET_MAIN_AGGREGATE}'!A:A"
         ).execute()
         values = result.get("values", [])
-        
-        if len(values) <= 1:  # Only header or empty
+
+        if len(values) <= 1:
             return None
-        
-        # Find the latest date (column A has dates, row 0 is header)
+
         latest = None
         for row in values[1:]:
             if row and row[0]:
@@ -102,7 +137,7 @@ def get_last_synced_date(service):
                     d = datetime.strptime(row[0], "%Y-%m-%d").date()
                     if latest is None or d > latest:
                         latest = d
-                except:
+                except Exception:
                     pass
         return latest
     except Exception as e:
@@ -130,34 +165,35 @@ def get_date_chunks(start_date, end_date):
 def fetch_campaigns():
     print("🔎 Fetching Campaign List...")
     url = f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Campaigns"
-    
+
     for attempt in range(5):
         try:
-            response = requests.get(url, auth=AUTH, headers={"Accept": "application/json"})
-            
+            response = requests.get(
+                url, auth=AUTH, headers={"Accept": "application/json"}, timeout=30
+            )
+
             if response.status_code == 200:
                 data = response.json()
                 campaigns = data.get("Campaigns", []) or data.get("Records", [])
                 print(f"✅ Found {len(campaigns)} Campaigns.")
                 return campaigns
-            
+
             elif response.status_code == 429:
                 retry_after = response.headers.get("Retry-After")
-                wait = int(retry_after) if retry_after else 60
-                if wait > 300:
-                    wait = 300
+                wait = min(int(retry_after) if retry_after else 60, 300)
                 print(f"   ⏳ Rate limited. Waiting {wait}s (attempt {attempt+1}/5)...")
                 time.sleep(wait)
                 continue
-            
+
             else:
-                print(f"❌ Failed to list campaigns: {response.status_code}")
+                print(f"❌ Failed to list campaigns: {response.status_code} — {response.text[:200]}")
                 return []
+
         except Exception as e:
-            print(f"❌ Exception: {e}")
+            print(f"❌ Exception fetching campaigns: {e}")
             return []
-    
-    print("❌ Rate limit not clearing.")
+
+    print("❌ Rate limit not clearing after 5 attempts.")
     return []
 
 # ==========================================================
@@ -165,8 +201,7 @@ def fetch_campaigns():
 # ==========================================================
 def fetch_actions(campaigns, date_chunks):
     print(f"\n📊 Fetching Actions in {len(date_chunks)} chunks...")
-    
-    actions_data = defaultdict(lambda: {'actions': 0, 'revenue': 0.0, 'cost': 0.0})
+    actions_data = defaultdict(lambda: {"actions": 0, "revenue": 0.0, "cost": 0.0})
 
     for campaign in campaigns:
         campaign_id = campaign.get("Id")
@@ -182,25 +217,26 @@ def fetch_actions(campaigns, date_chunks):
                     "ActionDateEnd": chunk_end,
                     "Page": page,
                     "PageSize": PAGE_SIZE,
-                    "Format": "JSON"
+                    "Format": "JSON",
                 }
                 try:
                     response = requests.get(
                         f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Actions",
-                        params=params, auth=AUTH,
-                        headers={"Accept": "application/json"}
+                        params=params,
+                        auth=AUTH,
+                        headers={"Accept": "application/json"},
+                        timeout=60,
                     )
-                    
+
                     if response.status_code == 429:
                         retry_after = response.headers.get("Retry-After")
-                        wait = int(retry_after) if retry_after else 60
-                        if wait > 300:
-                            wait = 300
+                        wait = min(int(retry_after) if retry_after else 60, 300)
                         print(f"      ⏳ Rate limited. Waiting {wait}s...")
                         time.sleep(wait)
                         continue
-                    
+
                     if response.status_code != 200:
+                        print(f"      ⚠️ Actions {response.status_code} for chunk {chunk_start[:10]}")
                         break
 
                     data = response.json()
@@ -212,21 +248,22 @@ def fetch_actions(campaigns, date_chunks):
                         raw_date = action.get("EventDate", "")
                         date_str = parse_iso_date(raw_date)
                         partner_name = action.get("MediaPartnerName", "Unknown")
-                        revenue = float(action.get("Amount", 0.0))
-                        payout = float(action.get("Payout", 0.0))
-                        
+                        revenue = float(action.get("Amount", 0.0) or 0.0)
+                        payout = float(action.get("Payout", 0.0) or 0.0)
+
                         key = (date_str, campaign_name, partner_name)
-                        actions_data[key]['actions'] += 1
-                        actions_data[key]['revenue'] += revenue
-                        actions_data[key]['cost'] += payout
+                        actions_data[key]["actions"] += 1
+                        actions_data[key]["revenue"] += revenue
+                        actions_data[key]["cost"] += payout
 
                     next_uri = data.get("@nextpageuri")
                     if not next_uri or len(actions) < PAGE_SIZE:
                         break
                     page += 1
                     time.sleep(RATE_LIMIT_DELAY)
+
                 except Exception as e:
-                    print(f"      ❌ Error: {e}")
+                    print(f"      ❌ Error fetching actions: {e}")
                     break
 
     return actions_data
@@ -237,91 +274,110 @@ def fetch_actions(campaigns, date_chunks):
 def submit_click_job(campaign_id, start_date, end_date):
     url = f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Programs/{campaign_id}/ClickExport"
     params = {"DateStart": start_date, "DateEnd": end_date}
-    
+
     for retry in range(CLICK_429_MAX_RETRIES):
-        resp = requests.get(url, params=params, auth=AUTH, headers={"Accept": "application/json"})
-        
-        if resp.status_code == 200:
-            data = resp.json()
-            queued_uri = data.get("QueuedUri", "")
-            if "/Jobs/" in queued_uri:
-                return queued_uri.split("/Jobs/")[1].split("/")[0]
+        try:
+            resp = requests.get(
+                url, params=params, auth=AUTH,
+                headers={"Accept": "application/json"}, timeout=30
+            )
+
+            if resp.status_code == 200:
+                data = resp.json()
+                queued_uri = data.get("QueuedUri", "")
+                if "/Jobs/" in queued_uri:
+                    return queued_uri.split("/Jobs/")[1].split("/")[0]
+                return None
+
+            elif resp.status_code == 429:
+                retry_after = resp.headers.get("Retry-After")
+                wait = int(retry_after) if retry_after else CLICK_429_BASE_WAIT * (retry + 1)
+                if wait > CLICK_429_MAX_WAIT:
+                    print(f"      ⚠️ Retry-After {wait}s exceeds max. Skipping.")
+                    return "RATE_LIMITED"
+                print(f"      ⏳ 429. Waiting {wait}s (retry {retry+1}/{CLICK_429_MAX_RETRIES})...")
+                time.sleep(wait)
+
+            else:
+                print(f"      ⚠️ Submit click job failed: {resp.status_code}")
+                return None
+
+        except Exception as e:
+            print(f"      ❌ Exception submitting click job: {e}")
             return None
-        
-        elif resp.status_code == 429:
-            retry_after = resp.headers.get("Retry-After")
-            wait = int(retry_after) if retry_after else CLICK_429_BASE_WAIT * (retry + 1)
-            if wait > CLICK_429_MAX_WAIT:
-                print(f"      ⚠️ Retry-After {wait}s. Skipping (rate limited).")
-                return "RATE_LIMITED"
-            print(f"      ⏳ 429. Waiting {wait}s (retry {retry+1}/{CLICK_429_MAX_RETRIES})...")
-            time.sleep(wait)
-        else:
-            print(f"      ⚠️ Submit failed: {resp.status_code}")
-            return None
-    
+
     return None
 
 def fetch_clicks(campaigns, start_date, end_date):
     print(f"\n🖱️ Fetching Clicks via ClickExport...")
-    
-    clicks_data = defaultdict(lambda: {'clicks': 0, 'cpc_total': 0.0})
-    
+    clicks_data = defaultdict(lambda: {"clicks": 0, "cpc_total": 0.0})
+
     for i, campaign in enumerate(campaigns):
         campaign_id = campaign.get("Id")
         campaign_name = campaign.get("Name")
         print(f"\n   🔄 Clicks [{i+1}/{len(campaigns)}]: {campaign_name} ({campaign_id})")
-        
+
         if i > 0:
-            print(f"      ⏳ Waiting {CLICK_BETWEEN_CAMPAIGNS}s...")
+            print(f"      ⏳ Waiting {CLICK_BETWEEN_CAMPAIGNS}s between campaigns...")
             time.sleep(CLICK_BETWEEN_CAMPAIGNS)
-        
+
         try:
             job_id = submit_click_job(campaign_id, start_date, end_date)
             if job_id == "RATE_LIMITED":
-                print(f"\n   ⚠️ ClickExport rate limited. Skipping remaining.")
+                print(f"\n   ⚠️ ClickExport rate limited. Skipping remaining campaigns.")
                 break
             if not job_id:
+                print(f"      ⚠️ No job ID returned. Skipping.")
                 continue
-            
-            print(f"      📋 Job: {job_id}")
-            
+
+            print(f"      📋 Job ID: {job_id}")
+
             job_url = f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Jobs/{job_id}"
             completed = False
-            
-            for _ in range(CLICK_MAX_POLLS):
+
+            for poll in range(CLICK_MAX_POLLS):
                 time.sleep(CLICK_POLL_INTERVAL)
-                resp = requests.get(job_url, auth=AUTH, headers={"Accept": "application/json"})
-                if resp.status_code == 200:
-                    status = resp.json().get("Status", "UNKNOWN")
-                    if status == "COMPLETED":
-                        completed = True
-                        break
-                    elif status in ["FAILED", "CANCELLED"]:
-                        break
-            
+                try:
+                    resp = requests.get(
+                        job_url, auth=AUTH,
+                        headers={"Accept": "application/json"}, timeout=30
+                    )
+                    if resp.status_code == 200:
+                        status = resp.json().get("Status", "UNKNOWN")
+                        print(f"      ⏳ Poll {poll+1}: {status}")
+                        if status == "COMPLETED":
+                            completed = True
+                            break
+                        elif status in ["FAILED", "CANCELLED"]:
+                            print(f"      ❌ Job {status}")
+                            break
+                except Exception as e:
+                    print(f"      ⚠️ Poll error: {e}")
+
             if not completed:
-                print(f"      ⚠️ Job did not complete")
+                print(f"      ⚠️ Job did not complete in time. Skipping.")
                 continue
-            
+
             download_url = f"{IMPACT_BASE_URL}/Advertisers/{ACCOUNT_SID}/Jobs/{job_id}/Download"
-            resp = requests.get(download_url, auth=AUTH)
-            
+            resp = requests.get(download_url, auth=AUTH, timeout=120)
+
             if resp.status_code == 200:
                 reader = csv.DictReader(io.StringIO(resp.text))
                 rows = list(reader)
-                print(f"      ✅ {len(rows)} clicks")
-                
+                print(f"      ✅ {len(rows)} click rows downloaded")
+
                 for row in rows:
                     event_date = row.get("EventDate", "")
                     date_str = parse_iso_date(event_date)
                     partner_name = row.get("MediaName", "Unknown")
-                    
+
                     key = (date_str, campaign_name, partner_name)
-                    clicks_data[key]['clicks'] += 1
-            
+                    clicks_data[key]["clicks"] += 1
+            else:
+                print(f"      ⚠️ Download failed: {resp.status_code}")
+
         except Exception as e:
-            print(f"      ❌ Error: {e}")
+            print(f"      ❌ Error processing clicks for {campaign_name}: {e}")
             continue
 
     return clicks_data
@@ -331,62 +387,63 @@ def fetch_clicks(campaigns, start_date, end_date):
 # ==========================================================
 def merge_data(actions_data, clicks_data):
     print(f"\n✅ Merging {len(actions_data)} action keys + {len(clicks_data)} click keys...")
-    
+
     all_keys = set(actions_data.keys()) | set(clicks_data.keys())
     rows = []
     brand_rows = defaultdict(list)
-    
+
     sorted_keys = sorted(all_keys, key=lambda x: x[0], reverse=True)
-    
+
     for key in sorted_keys:
         date_str, campaign_name, partner_name = key
-        
-        a = actions_data.get(key, {'actions': 0, 'revenue': 0.0, 'cost': 0.0})
-        c = clicks_data.get(key, {'clicks': 0, 'cpc_total': 0.0})
-        
-        actions = a['actions']
-        revenue = round(a['revenue'], 2)
-        total_cost = round(a['cost'], 2)
-        clicks = c['clicks']
+
+        a = actions_data.get(key, {"actions": 0, "revenue": 0.0, "cost": 0.0})
+        c = clicks_data.get(key, {"clicks": 0, "cpc_total": 0.0})
+
+        actions = a["actions"]
+        revenue = round(a["revenue"], 2)
+        total_cost = round(a["cost"], 2)
+        clicks = c["clicks"]
         cpc = round(total_cost / clicks, 2) if clicks > 0 else 0.0
-        
+
         row = [date_str, campaign_name, partner_name, clicks, actions, revenue, total_cost, total_cost, cpc]
         rows.append(row)
-        
+
         clean_name = campaign_name.replace(":", "").replace("/", "-")[:30]
         brand_rows[clean_name].append(row)
 
     return rows, brand_rows
 
 # ==========================================================
-# GOOGLE SHEETS — INCREMENTAL APPEND
+# GOOGLE SHEETS — Write / Append
 # ==========================================================
 def ensure_sheet_exists(service, sheet_title):
+    """Create sheet if it doesn't exist. Returns True if newly created."""
     try:
         metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-        existing = [s['properties']['title'] for s in metadata.get('sheets', [])]
-        
+        existing = [s["properties"]["title"] for s in metadata.get("sheets", [])]
+
         if sheet_title not in existing:
-            print(f"      🆕 Creating: {sheet_title}")
+            print(f"      🆕 Creating sheet: {sheet_title}")
             service.spreadsheets().batchUpdate(
                 spreadsheetId=SPREADSHEET_ID,
-                body={'requests': [{'addSheet': {'properties': {'title': sheet_title}}}]}
+                body={"requests": [{"addSheet": {"properties": {"title": sheet_title}}}]},
             ).execute()
-            return True  # New sheet, needs header
+            return True
         return False
     except Exception as e:
-        print(f"      ⚠️ Error: {e}")
+        print(f"      ⚠️ ensure_sheet_exists error: {e}")
         return False
 
 def sheet_has_data(service, sheet_title):
-    """Check if sheet has any data."""
+    """Check if sheet has any data in A1."""
     try:
         result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID,
             range=f"'{sheet_title}'!A1"
         ).execute()
         return bool(result.get("values"))
-    except:
+    except Exception:
         return False
 
 def clear_all_sheets(service):
@@ -394,74 +451,74 @@ def clear_all_sheets(service):
     print("\n🧹 Clearing ALL existing sheets...")
     try:
         metadata = service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-        sheets = metadata.get('sheets', [])
-        
+        sheets = metadata.get("sheets", [])
+
         delete_requests = []
         for sheet in sheets:
-            title = sheet['properties']['title']
-            sheet_id = sheet['properties']['sheetId']
+            title = sheet["properties"]["title"]
+            sheet_id = sheet["properties"]["sheetId"]
             if title != SHEET_MAIN_AGGREGATE:
                 print(f"   🗑️ Deleting: {title}")
-                delete_requests.append({'deleteSheet': {'sheetId': sheet_id}})
-        
+                delete_requests.append({"deleteSheet": {"sheetId": sheet_id}})
+
         if delete_requests:
             service.spreadsheets().batchUpdate(
                 spreadsheetId=SPREADSHEET_ID,
-                body={'requests': delete_requests}
+                body={"requests": delete_requests},
             ).execute()
-        
+
         service.spreadsheets().values().clear(
             spreadsheetId=SPREADSHEET_ID,
-            range=f"'{SHEET_MAIN_AGGREGATE}'!A:Z"
+            range=f"'{SHEET_MAIN_AGGREGATE}'!A:Z",
         ).execute()
-        print("   ✅ Cleared.")
+        print("   ✅ All sheets cleared.")
     except Exception as e:
-        print(f"   ⚠️ Error: {e}")
+        print(f"   ⚠️ clear_all_sheets error: {e}")
 
 def sync_to_sheets(master_rows, brand_rows, full_refresh):
     service = get_sheets_service()
     sheets = service.spreadsheets()
-    
-    header = [["DATE", "CAMPAIGN", "PARTNER", "CLICKS", "ACTIONS", "REVENUE USD", "ACTIONS COST USD", "TOTAL COST USD", "CPC USD"]]
+
+    header = [[
+        "DATE", "CAMPAIGN", "PARTNER", "CLICKS",
+        "ACTIONS", "REVENUE USD", "ACTIONS COST USD", "TOTAL COST USD", "CPC USD"
+    ]]
 
     if full_refresh:
         clear_all_sheets(service)
-    
+
     print("\n📤 Syncing to Google Sheets...")
 
-    # --- Sheet1 (Master) ---
+    # --- Sheet1 (Master Aggregate) ---
     print(f"   👉 '{SHEET_MAIN_AGGREGATE}': {len(master_rows)} rows")
-    
+
     if full_refresh or not sheet_has_data(service, SHEET_MAIN_AGGREGATE):
-        # Write header + data
         sheets.values().update(
             spreadsheetId=SPREADSHEET_ID,
             range=f"'{SHEET_MAIN_AGGREGATE}'!A1",
             valueInputOption="RAW",
-            body={"values": header + master_rows}
+            body={"values": header + master_rows},
         ).execute()
     else:
-        # Append new rows
         sheets.values().append(
             spreadsheetId=SPREADSHEET_ID,
             range=f"'{SHEET_MAIN_AGGREGATE}'!A:I",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
-            body={"values": master_rows}
+            body={"values": master_rows},
         ).execute()
-    
-    # --- Brand sheets ---
+
+    # --- Per-brand sheets ---
     for sheet_name, data_rows in brand_rows.items():
         print(f"   👉 '{sheet_name}': {len(data_rows)} rows")
-        
         is_new = ensure_sheet_exists(service, sheet_name)
-        
+
         if full_refresh or is_new:
             sheets.values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=f"'{sheet_name}'!A1",
                 valueInputOption="RAW",
-                body={"values": header + data_rows}
+                body={"values": header + data_rows},
             ).execute()
         else:
             sheets.values().append(
@@ -469,78 +526,90 @@ def sync_to_sheets(master_rows, brand_rows, full_refresh):
                 range=f"'{sheet_name}'!A:I",
                 valueInputOption="RAW",
                 insertDataOption="INSERT_ROWS",
-                body={"values": data_rows}
+                body={"values": data_rows},
             ).execute()
 
 # ==========================================================
-# MAIN
+# MAIN SYNC LOGIC
 # ==========================================================
-def main():
-    full_refresh = "--full" in sys.argv
-    skip_clicks = "--skip-clicks" in sys.argv
-    
+def main(full_refresh=False, skip_clicks=False):
+    # Allow CLI overrides
+    if "--full" in sys.argv:
+        full_refresh = True
+    if "--skip-clicks" in sys.argv:
+        skip_clicks = True
+
     print("🚀 Impact Data Sync")
     print(f"   Mode: {'FULL REFRESH' if full_refresh else 'INCREMENTAL'}")
-    
+    print(f"   Skip Clicks: {skip_clicks}")
+
     # Determine date range
     service = get_sheets_service()
-    
+
     if full_refresh:
-        start_date = (datetime.today() - timedelta(days=1095)).date()  # 3 years
-        print(f"   Full refresh from {start_date}")
+        start_date = (datetime.today() - timedelta(days=1095)).date()  # ~3 years
+        print(f"   Full refresh from: {start_date}")
     else:
         last_date = get_last_synced_date(service)
         if last_date:
-            start_date = last_date  # Re-fetch last date to capture any late actions
+            start_date = last_date  # Re-fetch last date to capture late actions
             print(f"   Last synced: {last_date} → fetching from {start_date}")
         else:
             start_date = (datetime.today() - timedelta(days=1095)).date()
-            full_refresh = True  # Empty sheet, do full refresh
-            print(f"   No data found. Full refresh from {start_date}")
-    
+            full_refresh = True
+            print(f"   No existing data. Full refresh from: {start_date}")
+
     end_date = datetime.today().date()
-    
+
     if start_date >= end_date:
         print("✅ Already up to date. Nothing to sync.")
         return
-    
+
+    print(f"   Date range: {start_date} → {end_date}")
+
     # Fetch campaigns
     campaigns = fetch_campaigns()
     if not campaigns:
-        print("❌ No campaigns found.")
+        print("❌ No campaigns found. Aborting.")
         return
-    
+
     # Fetch Actions
     date_chunks = get_date_chunks(start_date, end_date)
     actions_data = fetch_actions(campaigns, date_chunks)
-    
+
     # Fetch Clicks
     if skip_clicks:
-        print("\n   ⏭️ Clicks: SKIPPED")
+        print("\n   ⏭️ Clicks: SKIPPED (--skip-clicks flag)")
         clicks_data = {}
     else:
-        clicks_data = fetch_clicks(campaigns, start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d'))
-    
+        clicks_data = fetch_clicks(
+            campaigns,
+            start_date.strftime("%Y-%m-%d"),
+            end_date.strftime("%Y-%m-%d")
+        )
+
     # Merge
     master_rows, brand_rows = merge_data(actions_data, clicks_data)
-    
+
     if not master_rows:
         print("✅ No new data found.")
         return
-    
-    # Sync to Sheets
+
+    # Write to Sheets
     sync_to_sheets(master_rows, brand_rows, full_refresh)
-    
+
     print(f"\n🎉 SYNC COMPLETE — {len(master_rows)} rows synced.")
 
-def run_sync():
-    main()
 
-
+# ==========================================================
+# ENTRY POINT
+# ==========================================================
 if __name__ == "__main__":
-    # Start your sync logic in a background thread
-    threading.Thread(target=run_sync).start()
+    # Run sync in background thread so Flask can start immediately
+    sync_thread = threading.Thread(target=main, daemon=True)
+    sync_thread.start()
 
-    # Bind to Render-required host + port
+    # Bind Flask to Render's required host + port
     port = int(os.environ.get("PORT", 10000))
+    print(f"🌐 Starting Flask on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port)
