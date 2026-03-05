@@ -1,0 +1,67 @@
+name: Impact Data Sync
+
+on:
+  workflow_dispatch:
+    inputs:
+      full_refresh:
+        description: "Run a full refresh (last 3 years)"
+        required: false
+        default: false
+        type: boolean
+      skip_clicks:
+        description: "Skip click ingestion"
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: "0 6 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      IMPACT_ACCOUNT_SID: ${{ secrets.IMPACT_ACCOUNT_SID }}
+      IMPACT_AUTH_TOKEN: ${{ secrets.IMPACT_AUTH_TOKEN }}
+      GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+      SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Validate required secrets
+        run: |
+          missing=0
+          for var in IMPACT_ACCOUNT_SID IMPACT_AUTH_TOKEN GOOGLE_CREDENTIALS_JSON SPREADSHEET_ID; do
+            if [ -z "${!var}" ]; then
+              echo "::error::Missing required secret mapped to env var: $var"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+      - name: Run Impact sync
+        run: |
+          args="--no-server"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.full_refresh }}" = "true" ]; then
+            args="$args --full"
+          fi
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.skip_clicks }}" = "true" ]; then
+            args="$args --skip-clicks"
+          fi
+          echo "Running: python main.py $args"
+          python main.py $args
