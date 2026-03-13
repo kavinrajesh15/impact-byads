@@ -1,0 +1,31 @@
+name: Ad Performance 1-Year Data Fill
+
+on:
+  workflow_dispatch: # Allows manual triggering from the GitHub Actions UI
+
+jobs:
+  sync_1_year_data:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          
+      - name: Install dependencies
+        run: |
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # Ensure pandas and google-api-python-client are installed if missing
+          pip install requests pandas google-api-python-client google-auth-httplib2 google-auth-oauthlib python-dotenv
+          
+      - name: Run Ad Performance 1-Year Sync
+        env:
+          IMPACT_ACCOUNT_SID: ${{ secrets.IMPACT_ACCOUNT_SID }}
+          IMPACT_AUTH_TOKEN: ${{ secrets.IMPACT_AUTH_TOKEN }}
+          AD_PERFORMANCE_SPREADSHEET_ID: ${{ secrets.AD_PERFORMANCE_SPREADSHEET_ID }}
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+        run: python ad_performance_sync_1_year.py
