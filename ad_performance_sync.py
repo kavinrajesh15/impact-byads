@@ -13,6 +13,11 @@ Usage:
 
 import os
 import sys
+import io
+# Force stdout/stderr to be UTF-8 even on Windows console
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 import json
 import time
 import csv
@@ -20,6 +25,7 @@ import io
 import base64
 import logging
 import argparse
+import threading
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
@@ -28,6 +34,7 @@ import pandas as pd
 from requests.auth import HTTPBasicAuth
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
+from flask import Flask, jsonify, request
 
 # ── Logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -41,6 +48,8 @@ log = logging.getLogger("ad_perf_sync")
 try:
     from dotenv import load_dotenv
     load_dotenv()
+    if os.path.exists("impact.env"):
+        load_dotenv("impact.env")
 except ImportError:
     pass
 
@@ -576,6 +585,9 @@ def write_ad_sheet(svc, ad_id: str, df: pd.DataFrame, full_refresh: bool):
     title = f"Ad_{ad_id}"
     rows_with_header = [HEADER_ROW] + _df_to_values(df)
 
+    existing_data = []
+    new_rows = []
+
     if full_refresh:
         log.info(f"   ✏️  Full-write {title}: {len(df)} rows")
         write_sheet(svc, title, rows_with_header, append=False)
@@ -593,7 +605,6 @@ def write_ad_sheet(svc, ad_id: str, df: pd.DataFrame, full_refresh: bool):
                 if len(row) >= 10:
                     existing_keys.add((row[0], row[2], row[9]))
 
-            new_rows = []
             for _, r in df.iterrows():
                 key = (str(r["Partner ID"]), str(r["Ad ID"]), str(r["Date"]))
                 if key not in existing_keys:
@@ -605,20 +616,134 @@ def write_ad_sheet(svc, ad_id: str, df: pd.DataFrame, full_refresh: bool):
             else:
                 log.info(f"   ⏭️  {title}: 0 new rows (all duplicates)")
 
+    # Calculate all-time rows for cumulative metrics
+    if full_refresh or len(existing_data) <= 1:
+        all_time_rows = _df_to_values(df)
+    else:
+        valid_existing = []
+        for row in existing_data[1:]:
+            if len(row) >= 10:
+                valid_existing.append(row)
+            elif len(row) > 0:
+                padded = row + [""] * (10 - len(row))
+                valid_existing.append(padded)
+        all_time_rows = valid_existing + new_rows
+
+    partner_ids = set()
+    total_clicks = 0
+    total_actions = 0
+    total_revenue = 0.0
+    total_cost = 0.0
+
+    for row in all_time_rows:
+        partner_ids.add(row[0])
+        try:
+            total_clicks += int(float(row[5])) if row[5] else 0
+        except ValueError:
+            pass
+        try:
+            total_actions += int(float(row[6])) if row[6] else 0
+        except ValueError:
+            pass
+        try:
+            total_revenue += float(row[7]) if row[7] else 0.0
+        except ValueError:
+            pass
+        try:
+            total_cost += float(row[8]) if row[8] else 0.0
+        except ValueError:
+            pass
+
+    return {
+        "partners": len(partner_ids),
+        "clicks":   total_clicks,
+        "actions":  total_actions,
+        "revenue":  total_revenue,
+        "cost":     total_cost,
+    }
+
 
 def write_sheet1_aggregate(svc, all_ads: list[dict], ad_metrics: dict[str, dict]):
     """
     Write Sheet1 with one row per Ad that has data,
     showing aggregate metrics.
     """
-    rows = []
-    for ad_id, m in sorted(ad_metrics.items(), key=lambda x: -x[1].get("revenue", 0)):
+    # 1. Read existing Sheet1 data
+    existing_rows = read_sheet_values(svc, f"'{SHEET1_NAME}'!A:M")
+    
+    # 2. Build map of existing cumulative metrics by ad_id
+    cumulative_metrics = {}
+    
+    if len(existing_rows) > 1:
+        for r in existing_rows[1:]:
+            if len(r) >= 10:
+                ad_id = str(r[1])
+                try:
+                    partners = int(r[4]) if r[4] else 0
+                except ValueError:
+                    partners = 0
+                try:
+                    clicks = int(r[5]) if r[5] else 0
+                except ValueError:
+                    clicks = 0
+                try:
+                    actions = int(r[6]) if r[6] else 0
+                except ValueError:
+                    actions = 0
+                try:
+                    revenue = float(r[7]) if r[7] else 0.0
+                except ValueError:
+                    revenue = 0.0
+                try:
+                    cost = float(r[8]) if r[8] else 0.0
+                except ValueError:
+                    cost = 0.0
+                
+                # Keep other metadata from Sheet1
+                ad_name = r[0]
+                ad_type = r[2] if len(r) > 2 else ""
+                landing_page = r[3] if len(r) > 3 else ""
+                start_date = r[11] if len(r) > 11 else ""
+                end_date = r[12] if len(r) > 12 else ""
+                
+                cumulative_metrics[ad_id] = {
+                    "ad_name": ad_name,
+                    "ad_type": ad_type,
+                    "landing_page": landing_page,
+                    "partners": partners,
+                    "clicks": clicks,
+                    "actions": actions,
+                    "revenue": revenue,
+                    "cost": cost,
+                    "start_date": start_date,
+                    "end_date": end_date,
+                }
+
+    # 3. Merge/overwrite with the new metrics from current run
+    for ad_id, m in ad_metrics.items():
+        # Find ad metadata
         ad_info = None
         for a in all_ads:
             if a["Id"] == ad_id:
                 ad_info = a
                 break
+        
+        cumulative_metrics[ad_id] = {
+            "ad_name": ad_info["Name"] if ad_info else (cumulative_metrics.get(ad_id, {}).get("ad_name") or f"Ad {ad_id}"),
+            "ad_type": ad_info.get("Type", "") if ad_info else (cumulative_metrics.get(ad_id, {}).get("ad_type") or ""),
+            "landing_page": ad_info.get("LandingPage", "") if ad_info else (cumulative_metrics.get(ad_id, {}).get("landing_page") or ""),
+            "partners": m.get("partners", 0),
+            "clicks": m.get("clicks", 0),
+            "actions": m.get("actions", 0),
+            "revenue": m.get("revenue", 0.0),
+            "cost": m.get("cost", 0.0),
+            "start_date": ad_info.get("StartDate", "") if ad_info else (cumulative_metrics.get(ad_id, {}).get("start_date") or ""),
+            "end_date": ad_info.get("EndDate", "") if ad_info else (cumulative_metrics.get(ad_id, {}).get("end_date") or ""),
+        }
 
+    # 4. Generate final rows sorted by revenue descending
+    rows = []
+    for ad_id, m in sorted(cumulative_metrics.items(), key=lambda x: -x[1].get("revenue", 0.0)):
         partners = m.get("partners", 0)
         clicks = m.get("clicks", 0)
         actions = m.get("actions", 0)
@@ -628,14 +753,14 @@ def write_sheet1_aggregate(svc, all_ads: list[dict], ad_metrics: dict[str, dict]
         cpc = round(total_cost / clicks, 2) if clicks > 0 else 0.0
 
         rows.append([
-            ad_info["Name"] if ad_info else f"Ad {ad_id}",
+            m.get("ad_name", f"Ad {ad_id}"),
             ad_id,
-            ad_info.get("Type", "") if ad_info else "",
-            ad_info.get("LandingPage", "") if ad_info else "",
+            m.get("ad_type", ""),
+            m.get("landing_page", ""),
             partners, clicks, actions, revenue,
             action_cost, total_cost, cpc,
-            ad_info.get("StartDate", "") if ad_info else "",
-            ad_info.get("EndDate", "") if ad_info else "",
+            m.get("start_date", ""),
+            m.get("end_date", ""),
         ])
 
     write_sheet(svc, SHEET1_NAME, [SHEET1_HEADER] + rows, append=False)
@@ -679,7 +804,22 @@ def determine_date_range(svc, full_refresh: bool) -> tuple[datetime, datetime, b
         values = read_sheet_values(svc, f"'{SUMMARY_SHEET}'!F2:F2")
         if values and values[0]:
             last_sync_str = values[0][0]
-            last_sync = datetime.fromisoformat(last_sync_str.replace("Z", "+00:00"))
+            try:
+                # Handle standard Z replacement
+                dt_str = last_sync_str.replace("Z", "+00:00")
+                last_sync = datetime.fromisoformat(dt_str)
+            except ValueError:
+                try:
+                    # Fallback for common ISO format variations
+                    last_sync = datetime.strptime(last_sync_str.split(".")[0], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+                except ValueError:
+                    # Fallback for date-only formats
+                    last_sync = datetime.strptime(last_sync_str.split("T")[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            
+            # Ensure last_sync is tz-aware
+            if last_sync.tzinfo is None:
+                last_sync = last_sync.replace(tzinfo=timezone.utc)
+
             start = last_sync - timedelta(hours=INCREMENTAL_HOURS)
             log.info(f"📅 Incremental: {start.date()} → {end.date()} (last sync: {last_sync_str})")
             return start, end, False
@@ -771,33 +911,13 @@ def run_pipeline(full_refresh: bool = False) -> int:
 
             # Write per-ad sheets + collect metrics
             for ad_id, ad_rows in ad_data.items():
-                # Aggregate metrics for Sheet1
-                partner_ids = set()
-                total_actions = 0
-                total_revenue = 0.0
-                total_cost = 0.0
-                total_clicks = 0
-                for row in ad_rows:
-                    partner_ids.add(row["partner_id"])
-                    total_actions += row["conversions"]
-                    total_revenue += row["revenue"]
-                    total_cost += row["cost"]
-                    total_clicks += row["clicks"]
-
-                ad_metrics[ad_id] = {
-                    "partners": len(partner_ids),
-                    "clicks":   total_clicks,
-                    "actions":  total_actions,
-                    "revenue":  total_revenue,
-                    "cost":     total_cost,
-                }
-
                 df = normalise(ad_rows)
                 if df.empty:
                     continue
 
                 try:
-                    write_ad_sheet(sheets_svc, ad_id, df, full_refresh=is_full)
+                    cumulative_metrics = write_ad_sheet(sheets_svc, ad_id, df, full_refresh=is_full)
+                    ad_metrics[ad_id] = cumulative_metrics
                     total_rows += len(df)
                     ads_with_data.add(ad_id)
                 except Exception as e:
@@ -832,6 +952,113 @@ def run_pipeline(full_refresh: bool = False) -> int:
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  Weekly Scheduler Math Helper
+# ══════════════════════════════════════════════════════════════════════
+
+def get_seconds_until_next_monday_12am():
+    """Calculate the exact seconds to wait until next Monday at 12:00 AM (midnight) local time."""
+    now = datetime.now()
+    days_ahead = (0 - now.weekday()) % 7
+    target = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
+    if target <= now:
+        target += timedelta(days=7)
+    
+    return (target - now).total_seconds()
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  Flask & Scheduler Server
+# ══════════════════════════════════════════════════════════════════════
+
+app = Flask(__name__)
+
+# Track status of scheduler runs
+scheduler_status = {
+    "last_run": None,
+    "last_duration_seconds": None,
+    "last_result": None,
+    "last_error": None,
+    "running": False
+}
+scheduler_lock = threading.Lock()
+
+@app.route("/")
+def index():
+    return jsonify({
+        "status": "ok",
+        "service": "Impact Ad Performance Sync Server",
+        "scheduler": scheduler_status
+    })
+
+@app.route("/health")
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+@app.route("/trigger", methods=["POST"])
+def trigger_sync():
+    full_refresh = request.args.get("full", "false").lower() == "true"
+    
+    def async_run():
+        with scheduler_lock:
+            if scheduler_status["running"]:
+                log.warning("Sync already running — skipping manual trigger.")
+                return
+            scheduler_status["running"] = True
+            
+        start_time = datetime.now()
+        scheduler_status["last_run"] = start_time.isoformat()
+        scheduler_status["last_error"] = None
+        try:
+            rows = run_pipeline(full_refresh=full_refresh)
+            scheduler_status["last_result"] = f"Success: {rows} rows synced."
+        except Exception as e:
+            log.error(f"Manual trigger sync failed: {e}", exc_info=True)
+            scheduler_status["last_error"] = str(e)
+            scheduler_status["last_result"] = "Failed"
+        finally:
+            scheduler_status["running"] = False
+            scheduler_status["last_duration_seconds"] = (datetime.now() - start_time).total_seconds()
+            
+    threading.Thread(target=async_run, daemon=True).start()
+    return jsonify({"status": "sync started", "full_refresh": full_refresh}), 202
+
+def run_scheduler():
+    log.info("⏰ Scheduler thread started.")
+    while True:
+        seconds_to_wait = get_seconds_until_next_monday_12am()
+        next_run = datetime.now() + timedelta(seconds=seconds_to_wait)
+        log.info(f"⏰ Next sync scheduled for Monday 12:00 AM (local time): {next_run.strftime('%Y-%m-%d %H:%M:%S')} (in {seconds_to_wait:.1f} seconds)")
+        
+        while seconds_to_wait > 0:
+            sleep_chunk = min(seconds_to_wait, 3600)
+            time.sleep(sleep_chunk)
+            seconds_to_wait -= sleep_chunk
+            
+        log.info("⏰ Scheduler triggered! Running sync pipeline...")
+        
+        with scheduler_lock:
+            if scheduler_status["running"]:
+                log.warning("Sync already running — skipping scheduler run.")
+                continue
+            scheduler_status["running"] = True
+            
+        start_time = datetime.now()
+        scheduler_status["last_run"] = start_time.isoformat()
+        scheduler_status["last_error"] = None
+        try:
+            # Under standard weekly scheduler, we run incremental (full_refresh=False)
+            rows = run_pipeline(full_refresh=False)
+            scheduler_status["last_result"] = f"Success: {rows} rows synced."
+        except Exception as e:
+            log.error(f"Scheduled sync failed: {e}", exc_info=True)
+            scheduler_status["last_error"] = str(e)
+            scheduler_status["last_result"] = "Failed"
+        finally:
+            scheduler_status["running"] = False
+            scheduler_status["last_duration_seconds"] = (datetime.now() - start_time).total_seconds()
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  CLI entry point
 # ══════════════════════════════════════════════════════════════════════
 
@@ -839,15 +1066,59 @@ def main():
     parser = argparse.ArgumentParser(description="Impact.com Ad Performance → Google Sheets sync")
     parser.add_argument("--full", action="store_true", help="Force full 90-day refresh")
     parser.add_argument("--no-server", action="store_true", help="Run headless (no Flask)")
+    parser.add_argument("--scheduler", action="store_true", help="Run continuously in a scheduler loop (headless or CLI)")
     args = parser.parse_args()
 
-    try:
-        rows = run_pipeline(full_refresh=args.full)
-        log.info(f"Exit 0 — {rows} rows synced.")
-        sys.exit(0)
-    except Exception as e:
-        log.error(f"Pipeline failed: {e}", exc_info=True)
-        sys.exit(1)
+    if args.no_server:
+        if args.scheduler:
+            log.info("CLI mode with scheduler — starting infinite sleep-run loop.")
+            # Run scheduler loop in main thread
+            try:
+                run_scheduler()
+            except KeyboardInterrupt:
+                log.info("Scheduler stopped by user.")
+                sys.exit(0)
+        else:
+            log.info("CLI mode — performing one-off sync.")
+            try:
+                rows = run_pipeline(full_refresh=args.full)
+                log.info(f"Exit 0 — {rows} rows synced.")
+                sys.exit(0)
+            except Exception as e:
+                log.error(f"Pipeline failed: {e}", exc_info=True)
+                sys.exit(1)
+    else:
+        log.info("Server mode — starting Flask web server + background scheduler.")
+        # Start background scheduler thread
+        threading.Thread(target=run_scheduler, daemon=True).start()
+        
+        # Trigger initial sync in background on startup
+        def initial_sync():
+            log.info("🚀 Triggering initial startup sync in background...")
+            with scheduler_lock:
+                if scheduler_status["running"]:
+                    return
+                scheduler_status["running"] = True
+            start_time = datetime.now()
+            scheduler_status["last_run"] = start_time.isoformat()
+            scheduler_status["last_error"] = None
+            try:
+                rows = run_pipeline(full_refresh=args.full)
+                scheduler_status["last_result"] = f"Success: {rows} rows synced."
+            except Exception as e:
+                log.error(f"Initial startup sync failed: {e}", exc_info=True)
+                scheduler_status["last_error"] = str(e)
+                scheduler_status["last_result"] = "Failed"
+            finally:
+                scheduler_status["running"] = False
+                scheduler_status["last_duration_seconds"] = (datetime.now() - start_time).total_seconds()
+                
+        threading.Thread(target=initial_sync, daemon=True).start()
+        
+        # Start Flask
+        port = int(os.environ.get("PORT", 10000))
+        log.info(f"Starting Flask on 0.0.0.0:{port}")
+        app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
 
 
 if __name__ == "__main__":
