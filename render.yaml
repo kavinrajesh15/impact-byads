@@ -4,7 +4,7 @@ services:
     runtime: python
     schedule: "0 6 * * *"  # Daily at 6 AM UTC
     buildCommand: pip install -r requirements.txt
-    startCommand: python ad_performance_sync.py
+    startCommand: python main.py
     envVars:
       - key: IMPACT_ACCOUNT_SID
         sync: false
