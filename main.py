@@ -78,7 +78,7 @@ MAX_PAGES = 200
 MAX_RETRIES = 5
 RATE_LIMIT_DELAY = 0.5
 FULL_HISTORY_DAYS = 90
-INCREMENTAL_HOURS = 48
+INCREMENTAL_HOURS = 168  # 7 days to get the entire week
 CHUNK_DAYS = 30  # must be ≤ 45 (API limit)
 
 # Click export settings
@@ -955,10 +955,10 @@ def run_pipeline(full_refresh: bool = False) -> int:
 #  Weekly Scheduler Math Helper
 # ══════════════════════════════════════════════════════════════════════
 
-def get_seconds_until_next_monday_12am():
-    """Calculate the exact seconds to wait until next Monday at 12:00 AM (midnight) local time."""
+def get_seconds_until_next_sunday_12am():
+    """Calculate the exact seconds to wait until next Sunday at 12:00 AM (midnight) local time."""
     now = datetime.now()
-    days_ahead = (0 - now.weekday()) % 7
+    days_ahead = (6 - now.weekday()) % 7
     target = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=days_ahead)
     if target <= now:
         target += timedelta(days=7)
@@ -1025,9 +1025,9 @@ def trigger_sync():
 def run_scheduler():
     log.info("⏰ Scheduler thread started.")
     while True:
-        seconds_to_wait = get_seconds_until_next_monday_12am()
+        seconds_to_wait = get_seconds_until_next_sunday_12am()
         next_run = datetime.now() + timedelta(seconds=seconds_to_wait)
-        log.info(f"⏰ Next sync scheduled for Monday 12:00 AM (local time): {next_run.strftime('%Y-%m-%d %H:%M:%S')} (in {seconds_to_wait:.1f} seconds)")
+        log.info(f"⏰ Next sync scheduled for Sunday 12:00 AM (local time): {next_run.strftime('%Y-%m-%d %H:%M:%S')} (in {seconds_to_wait:.1f} seconds)")
         
         while seconds_to_wait > 0:
             sleep_chunk = min(seconds_to_wait, 3600)
